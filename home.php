@@ -48,6 +48,31 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action']) && $_POST['a
     }
 }
 
+// ==========================================
+// HANDLE DELETING A CREDENTIAL (NEW CODE)
+// ==========================================
+if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action']) && $_POST['action'] === 'delete_credential') {
+    if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token']) {
+        die("Security token validation failed.");
+    }
+
+    $credential_id = intval($_POST['credential_id']);
+
+    // Ensure the entry actually belongs to the logged-in user before deleting
+    $stmt = $conn->prepare("DELETE FROM credentials WHERE id = ? AND user_id = ?");
+    $stmt->bind_param("ii", $credential_id, $_SESSION['user_id']);
+    
+    if ($stmt->execute()) {
+        log_system_event($conn, $_SESSION['username'], 'CREDENTIAL_DELETED_ID_' . $credential_id);
+        $message = "Credential removed successfully.";
+        $status = "success";
+    } else {
+        $message = "Failed to delete the credential.";
+        $status = "error";
+    }
+    $stmt->close();
+}
+
 // Fetch all existing credentials for this user, decrypting on the fly
 $search_query = "";
 if (isset($_GET['search'])) {
@@ -75,7 +100,7 @@ $stmt->close();
     <title>DaboreyPass - Dashboard</title>
     <style>
         body { font-family: 'Segoe UI', Arial, sans-serif; background-color: #0f172a; color: #f8fafc; margin: 0; padding: 20px; }
-        .container { max-width: 900px; margin: 0 auto; }
+        .container { max-width: 950px; margin: 0 auto; } /* Widened slightly to account for the new column */
         .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; padding-bottom: 20px; margin-bottom: 30px; }
         h1 { color: #38bdf8; margin: 0; font-size: 28px; }
         .welcome { color: #94a3b8; font-size: 14px; }
@@ -103,11 +128,17 @@ $stmt->close();
         
         .pass-container { display: flex; align-items: center; gap: 6px; }
         .pass-text { font-family: monospace; margin-right: 4px; }
-        .toggle-btn, .copy-btn { color: #fff; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 11px; width: auto; font-weight: normal; }
+        .toggle-btn, .copy-btn, .delete-btn { color: #fff; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 11px; width: auto; font-weight: normal; }
         .toggle-btn { background: #475569; }
         .toggle-btn:hover { background: #64748b; }
         .copy-btn { background: #10b981; }
         .copy-btn:hover { background: #059669; }
+        
+        /* Delete Button styling */
+        .delete-btn { background: #b91c1c; }
+        .delete-btn:hover { background: #991b1b; }
+        .delete-form { display: inline; margin: 0; padding: 0; }
+
         .no-data { text-align: center; color: #64748b; padding: 20px; }
     </style>
 </head>
@@ -160,12 +191,12 @@ $stmt->close();
                             <th>Resource</th>
                             <th>Identity Identifier</th>
                             <th>Security Profile</th>
-                        </tr>
+                            <th>Actions</th> </tr>
                     </thead>
                     <tbody>
                         <?php if (empty($credentials)): ?>
                             <tr>
-                                <td colspan="3" class="no-data">No stored profiles found.</td>
+                                <td colspan="4" class="no-data">No stored profiles found.</td>
                             </tr>
                         <?php else: ?>
                             <?php foreach ($credentials as $index => $row): ?>
@@ -183,6 +214,14 @@ $stmt->close();
                                             <button class="toggle-btn" onclick="togglePassword(<?php echo $index; ?>, '<?php echo htmlspecialchars(addslashes($display_password)); ?>')">Show</button>
                                             <button class="copy-btn" onclick="copyToClipboard(this, '<?php echo htmlspecialchars(addslashes($display_password)); ?>')">Copy</button>
                                         </div>
+                                    </td>
+                                    <td>
+                                        <form method="POST" action="" class="delete-form" onsubmit="return confirm('Are you sure you want to delete the credentials for <?php echo htmlspecialchars(addslashes($row['site_name'])); ?>?');">
+                                            <input type="hidden" name="action" value="delete_credential">
+                                            <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
+                                            <input type="hidden" name="credential_id" value="<?php echo $row['id']; ?>">
+                                            <button type="submit" class="delete-btn">Delete</button>
+                                        </form>
                                     </td>
                                 </tr>
                             <?php endforeach; ?>
