@@ -1,6 +1,6 @@
 -- 1. Create and select the database
-CREATE DATABASE IF NOT EXISTS daboreypass;
-USE daboreypass;
+CREATE DATABASE IF NOT EXISTS if0_42283348_daboreypass;
+USE if0_42283348_daboreypass;
 
 -- 2. Create the users table
 CREATE TABLE IF NOT EXISTS users (
