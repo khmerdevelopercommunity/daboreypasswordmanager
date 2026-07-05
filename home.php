@@ -21,135 +21,7 @@ $encryption_key = 'YourSuperSecretEncryptionKeyGoesHere';
 $message = "";
 $status = "";
 
-// FETCH ALL CURRENT CREDENTIALS FOR EXPORT OR VIEWING
-function fetchUserCredentials($conn, $userId, $encKey) {
-    $stmt = $conn->prepare("SELECT id, site_name, site_username, AES_DECRYPT(site_password, ?) AS decrypted_password FROM credentials WHERE user_id = ?");
-    $stmt->bind_param("si", $encKey, $userId);
-    $stmt->execute();
-    $result = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-    $stmt->close();
-    return $result;
-}
-
-// ACTION: EXPORT TO JSON FORMAT
-if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action']) && $_POST['action'] === 'export_backup') {
-    if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token']) {
-        die("Security token validation failed.");
-    }
-    
-    $vaultData = fetchUserCredentials($conn, $_SESSION['user_id'], $encryption_key);
-    log_system_event($conn, $_SESSION['username'], 'VAULT_JSON_EXPORTED');
-    
-    $exportData = [];
-    foreach ($vaultData as $row) {
-        $exportData[] = [
-            'site_name'     => $row['site_name'],
-            'site_username' => $row['site_username'],
-            'site_password' => $row['decrypted_password'] ?? ''
-        ];
-    }
-    
-    header('Content-Type: application/json; charset=utf-8');
-    header('Content-Disposition: attachment; filename="DaboreyPass_Vault_' . date('Ymd_His') . '.json"');
-    echo json_encode($exportData, JSON_PRETTY_PRINT);
-    exit;
-}
-
-// ACTION: UNIVERSAL 5-CONDITION FORGIVING IMPORT ENGINE
-if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action']) && $_POST['action'] === 'import_backup') {
-    if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token']) {
-        die("Security token validation failed.");
-    }
-
-    if (isset($_FILES['backup_file']) && $_FILES['backup_file']['error'] === UPLOAD_ERR_OK) {
-        $fileContent = file_get_contents($_FILES['backup_file']['tmp_name']);
-        $payload = json_decode($fileContent, true);
-        
-        if (is_array($payload)) {
-            $items = $payload;
-            
-            // Auto-unwrap if encapsulated in a parent root key node (like 'entries', 'items', 'logins')
-            if (!isset($payload[0])) { 
-                foreach ($payload as $key => $value) {
-                    if (is_array($value)) {
-                        $items = $value;
-                        break;
-                    }
-                }
-            }
-
-            $success_count = 0;
-            $stmt = $conn->prepare("INSERT INTO credentials (user_id, site_name, site_username, site_password) VALUES (?, ?, ?, AES_ENCRYPT(?, ?))");
-            
-            foreach ($items as $item) {
-                if (!is_array($item)) continue;
-
-                // Eliminate key header case mismatches seamlessly
-                $cleanItem = array_change_key_case($item, CASE_LOWER);
-
-                // 1. Identify Resource Name Variations
-                $site = trim($cleanItem['site_name'] ?? $cleanItem['name'] ?? $cleanItem['title'] ?? $cleanItem['url'] ?? 'Imported Resource');
-                
-                // 2. Identify Identity Username Variations
-                $user = trim($cleanItem['site_username'] ?? $cleanItem['username'] ?? $cleanItem['login_username'] ?? $cleanItem['email'] ?? $cleanItem['user'] ?? '');
-                
-                // 3. Modern 5-Stage Condition Fallback System to Extract Password Profile
-                $pass = '';
-
-                // CONDITION 1: Standard Dashboard Format
-                if (isset($cleanItem['site_password']) && !empty($cleanItem['site_password'])) {
-                    $pass = $cleanItem['site_password'];
-                } 
-                // CONDITION 2: Traditional Generic Format (password/pass)
-                elseif (isset($cleanItem['password']) && !empty($cleanItem['password'])) {
-                    $pass = $cleanItem['password'];
-                } elseif (isset($cleanItem['pass']) && !empty($cleanItem['pass'])) {
-                    $pass = $cleanItem['pass'];
-                } 
-                // CONDITION 3: Hardware / Alternative Crypt-variant label
-                elseif (isset($cleanItem['secret']) && !empty($cleanItem['secret'])) {
-                    $pass = $cleanItem['secret'];
-                } 
-                // CONDITION 4: Common Nested Manager Object Configuration (Bitwarden/Aegis structural fallback style)
-                elseif (isset($cleanItem['login']['password']) && !empty($cleanItem['login']['password'])) {
-                    $pass = $cleanItem['login']['password'];
-                } 
-                // CONDITION 5: Array Value Extraction Fallback (last resort match if raw array is passed)
-                elseif (count($cleanItem) >= 3 && empty($pass)) {
-                    $values = array_values($cleanItem);
-                    $pass = $values[2]; // Fallback to index position assumptions safely
-                }
-
-                $pass = trim($pass);
-
-                if (!empty($site) && !empty($pass)) {
-                    $stmt->bind_param("issss", $_SESSION['user_id'], $site, $user, $pass, $encryption_key);
-                    if ($stmt->execute()) {
-                        $success_count++;
-                    }
-                }
-            }
-            $stmt->close();
-            
-            if ($success_count > 0) {
-                log_system_event($conn, $_SESSION['username'], 'VAULT_JSON_IMPORTED_COUNT_' . $success_count);
-                $message = "Migration Complete! Loaded " . $success_count . " logins into your vault.";
-                $status = "success";
-            } else {
-                $message = "Could not map structural key data variables from this file schema template.";
-                $status = "error";
-            }
-        } else {
-            $message = "Invalid JSON file hierarchy structure format.";
-            $status = "error";
-        }
-    } else {
-        $message = "File system import failure. Check file sizes or try again.";
-        $status = "error";
-    }
-}
-
-// Handle adding a new credential manually
+// Handle adding a new credential
 if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action']) && $_POST['action'] === 'add_credential') {
     if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token']) {
         die("Security token validation failed.");
@@ -160,6 +32,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action']) && $_POST['a
     $site_password = trim($_POST['site_password']);
 
     if (!empty($site_name) && !empty($site_username) && !empty($site_password)) {
+        // Encrypt the password using MySQL's AES_ENCRYPT
         $stmt = $conn->prepare("INSERT INTO credentials (user_id, site_name, site_username, site_password) VALUES (?, ?, ?, AES_ENCRYPT(?, ?))");
         $stmt->bind_param("issss", $_SESSION['user_id'], $site_name, $site_username, $site_password, $encryption_key);
         
@@ -175,7 +48,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action']) && $_POST['a
     }
 }
 
-// HANDLE DELETING A CREDENTIAL
+// Handle deleting a credential
 if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action']) && $_POST['action'] === 'delete_credential') {
     if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token']) {
         die("Security token validation failed.");
@@ -183,6 +56,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action']) && $_POST['a
 
     $credential_id = intval($_POST['credential_id']);
 
+    // Ensure the entry actually belongs to the logged-in user before deleting
     $stmt = $conn->prepare("DELETE FROM credentials WHERE id = ? AND user_id = ?");
     $stmt->bind_param("ii", $credential_id, $_SESSION['user_id']);
     
@@ -197,21 +71,9 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action']) && $_POST['a
     $stmt->close();
 }
 
-// Fetch database records for viewing
-$search_query = "";
-if (isset($_GET['search'])) {
-    $search_query = trim($_GET['search']);
-}
-
-if (!empty($search_query)) {
-    $stmt = $conn->prepare("SELECT id, site_name, site_username, AES_DECRYPT(site_password, ?) AS decrypted_password FROM credentials WHERE user_id = ? AND (site_name LIKE ? OR site_username LIKE ?)");
-    $search_param = "%" . $search_query . "%";
-    $stmt->bind_param("sisss", $encryption_key, $_SESSION['user_id'], $search_param, $search_param);
-} else {
-    $stmt = $conn->prepare("SELECT id, site_name, site_username, AES_DECRYPT(site_password, ?) AS decrypted_password FROM credentials WHERE user_id = ?");
-    $stmt->bind_param("si", $encryption_key, $_SESSION['user_id']);
-}
-
+// Fetch all existing credentials for this user (filtering is handled on client-side)
+$stmt = $conn->prepare("SELECT id, site_name, site_username, AES_DECRYPT(site_password, ?) AS decrypted_password FROM credentials WHERE user_id = ?");
+$stmt->bind_param("si", $encryption_key, $_SESSION['user_id']);
 $stmt->execute();
 $result = $stmt->get_result();
 $credentials = $result->fetch_all(MYSQLI_ASSOC);
@@ -231,16 +93,21 @@ $stmt->close();
         .logout-btn { padding: 8px 16px; background: #ef4444; color: white; text-decoration: none; border-radius: 4px; font-weight: bold; font-size: 14px; }
         
         .grid { display: grid; grid-template-columns: 1fr 2fr; gap: 30px; }
-        .box { background: #1e293b; padding: 25px; border-radius: 8px; border: 1px solid #334155; height: fit-content; margin-bottom: 25px; }
+        .box { background: #1e293b; padding: 25px; border-radius: 8px; border: 1px solid #334155; height: fit-content; }
         h3 { margin-top: 0; color: #38bdf8; border-bottom: 1px solid #334155; padding-bottom: 10px; }
         
+        label { font-size: 13px; color: #94a3b8; display: block; margin-top: 10px; }
         input { width: 100%; padding: 10px; margin: 8px 0 16px 0; box-sizing: border-box; border: 1px solid #475569; border-radius: 4px; background: #0f172a; color: #fff; }
         button { width: 100%; padding: 12px; background: #0284c7; border: none; color: white; border-radius: 4px; cursor: pointer; font-weight: bold; }
         button:hover { background: #0369a1; }
 
-        .search-box { margin-bottom: 20px; display: flex; gap: 10px; }
-        .search-box input { margin: 0; }
-        .search-box button { width: auto; padding: 0 20px; }
+        /* Modernized Active Live Search Interface Bar Layout */
+        .search-container { margin-bottom: 20px; position: relative; }
+        .search-input { width: 100%; padding: 12px 14px; box-sizing: border-box; border: 1px solid #0284c7; border-radius: 6px; background: #0f172a; color: #fff; font-size: 14px; margin: 0; }
+        .search-input:focus { outline: none; border-color: #38bdf8; box-shadow: 0 0 8px rgba(56, 189, 248, 0.2); }
+        
+        /* Highlighting text design rules */
+        mark.highlight { background: #eab308; color: #0f172a; padding: 1px 3px; border-radius: 2px; font-weight: bold; }
 
         .error { color: #f87171; background: rgba(248,113,113,0.1); border: 1px solid rgba(248,113,113,0.2); padding: 10px; font-size: 14px; border-radius: 4px; margin-bottom: 15px; }
         .success { color: #34d399; background: rgba(52,211,153,0.1); border: 1px solid rgba(52,211,153,0.2); padding: 10px; font-size: 14px; border-radius: 4px; margin-bottom: 15px; }
@@ -262,14 +129,8 @@ $stmt->close();
         .delete-btn:hover { background: #991b1b; }
         .delete-form { display: inline; margin: 0; padding: 0; }
 
-        /* Migration Toolkit Interface */
-        .backup-tray { display: flex; flex-direction: column; gap: 14px; border-top: 2px dashed #334155; padding-top: 20px; margin-top: 20px; }
-        .btn-backup { background: #4f46e5; border: none; color: white; font-weight: bold; padding: 12px; border-radius: 4px; cursor: pointer; width: 100%; text-align: center; display: block; text-decoration: none; font-size: 14px; box-sizing: border-box; }
-        .btn-backup:hover { background: #4338ca; }
-        .import-box-area { background: #0f172a; border: 1px dashed #475569; border-radius: 6px; padding: 14px; text-align: center; cursor: pointer; color: #94a3b8; font-size: 13px; }
-        .import-box-area:hover { border-color: #a855f7; color: #fff; }
-
         .no-data { text-align: center; color: #64748b; padding: 20px; }
+        #no-results-row { display: none; text-align: center; color: #64748b; }
     </style>
 </head>
 <body>
@@ -288,54 +149,31 @@ $stmt->close();
         ?>
 
         <div class="grid">
-            <div>
-                <div class="box">
-                    <h3>Add New Entry</h3>
-                    <form method="POST" action="">
-                        <input type="hidden" name="action" value="add_credential">
-                        <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
-                        
-                        <label>Website Name / Resource</label>
-                        <input type="text" name="site_name" placeholder="e.g. Google, GitHub" required autocomplete="off">
-                        
-                        <label>Username / Email</label>
-                        <input type="text" name="site_username" placeholder="Username" required autocomplete="off">
-                        
-                        <label>Password</label>
-                        <input type="password" name="site_password" placeholder="Password" required>
-                        
-                        <button type="submit">Secure Entry</button>
-                    </form>
-                </div>
-
-                <div class="box">
-                    <h3>Vault Migration</h3>
-                    <div class="backup-tray">
-                        <form method="POST" action="">
-                            <input type="hidden" name="action" value="export_backup">
-                            <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
-                            <button type="submit" class="btn-backup">Export Vault (.json)</button>
-                        </form>
-
-                        <form method="POST" action="" enctype="multipart/form-data" id="import-form">
-                            <input type="hidden" name="action" value="import_backup">
-                            <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
-                            <div class="import-box-area" onclick="document.getElementById('import-file-input').click()">
-                                <span>Click to Import Backup JSON</span>
-                                <input type="file" id="import-file-input" name="backup_file" accept=".json" style="display:none;" onchange="document.getElementById('import-form').submit();">
-                            </div>
-                        </form>
-                    </div>
-                </div>
+            <div class="box">
+                <h3>Add New Entry</h3>
+                <form method="POST" action="">
+                    <input type="hidden" name="action" value="add_credential">
+                    <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
+                    
+                    <label>Website Name / Resource</label>
+                    <input type="text" name="site_name" placeholder="e.g. Google, GitHub" required autocomplete="off">
+                    
+                    <label>Username / Email</label>
+                    <input type="text" name="site_username" placeholder="Username" required autocomplete="off">
+                    
+                    <label>Password</label>
+                    <input type="password" name="site_password" placeholder="Password" required>
+                    
+                    <button type="submit">Secure Entry</button>
+                </form>
             </div>
 
             <div class="box">
                 <h3>Stored Logins</h3>
                 
-                <form method="GET" action="" class="search-box">
-                    <input type="text" name="search" placeholder="Search by site or username..." value="<?php echo htmlspecialchars($search_query); ?>" autocomplete="off">
-                    <button type="submit">Filter</button>
-                </form>
+                <div class="search-container">
+                    <input type="text" id="live-search-bar" class="search-input" placeholder="Type to search & filter entries instantly..." autocomplete="off">
+                </div>
 
                 <table>
                     <thead>
@@ -343,11 +181,16 @@ $stmt->close();
                             <th>Resource</th>
                             <th>Identity Identifier</th>
                             <th>Security Profile</th>
-                            <th>Actions</th> </tr>
+                            <th>Actions</th> 
+                        </tr>
                     </thead>
-                    <tbody>
+                    <tbody id="credentials-table-body">
+                        <tr id="no-results-row">
+                            <td colspan="4" class="no-data">No matching entries found.</td>
+                        </tr>
+
                         <?php if (empty($credentials)): ?>
-                            <tr>
+                            <tr class="empty-db-fallback">
                                 <td colspan="4" class="no-data">No stored profiles found.</td>
                             </tr>
                         <?php else: ?>
@@ -357,9 +200,13 @@ $stmt->close();
                                     ? $row['decrypted_password'] 
                                     : '[Decryption Error]';
                                 ?>
-                                <tr>
-                                    <td><strong><?php echo htmlspecialchars($row['site_name']); ?></strong></td>
-                                    <td><?php echo htmlspecialchars($row['site_username']); ?></td>
+                                <tr class="credential-row">
+                                    <td>
+                                        <strong class="searchable-site-name" data-raw-text="<?php echo htmlspecialchars($row['site_name']); ?>"><?php echo htmlspecialchars($row['site_name']); ?></strong>
+                                    </td>
+                                    <td>
+                                        <span class="searchable-site-username" data-raw-text="<?php echo htmlspecialchars($row['site_username']); ?>"><?php echo htmlspecialchars($row['site_username']); ?></span>
+                                    </td>
                                     <td>
                                         <div class="pass-container">
                                             <span class="pass-text" id="pass-<?php echo $index; ?>">••••••••</span>
@@ -385,6 +232,68 @@ $stmt->close();
     </div>
 
     <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const searchBar = document.getElementById('live-search-bar');
+        if (searchBar) {
+            searchBar.addEventListener('input', runLiveCredentialsSearchFilter);
+        }
+    });
+
+    // REAL TIME SEARCH, DYNAMIC SEAMLESS FILTERING, AND HIGHLIGHTING ENGINE
+    function runLiveCredentialsSearchFilter() {
+        const query = this.value.trim().toLowerCase();
+        const rows = document.querySelectorAll('.credential-row');
+        const noResultsRow = document.getElementById('no-results-row');
+        let visibleCount = 0;
+
+        rows.forEach(row => {
+            const nameNode = row.querySelector('.searchable-site-name');
+            const userNode = row.querySelector('.searchable-site-username');
+            
+            const originalName = nameNode.getAttribute('data-raw-text');
+            const originalUser = userNode.getAttribute('data-raw-text');
+            
+            if (!query) {
+                // If query input string is empty, reset display parameters completely
+                row.style.display = '';
+                nameNode.textContent = originalName;
+                userNode.textContent = originalUser;
+                visibleCount++;
+            } else {
+                const matchesName = originalName.toLowerCase().includes(query);
+                const matchesUser = originalUser.toLowerCase().includes(query);
+
+                if (matchesName || matchesUser) {
+                    row.style.display = '';
+                    visibleCount++;
+                    
+                    // Escaping character definitions safely to deploy regular expression rules
+                    const regex = new RegExp(`(${query.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&')})`, 'gi');
+                    
+                    if (matchesName) {
+                        nameNode.innerHTML = originalName.replace(regex, '<mark class="highlight">$1</mark>');
+                    } else {
+                        nameNode.textContent = originalName;
+                    }
+                    
+                    if (matchesUser) {
+                        userNode.innerHTML = originalUser.replace(regex, '<mark class="highlight">$1</mark>');
+                    } else {
+                        userNode.textContent = originalUser;
+                    }
+                } else {
+                    // Match pattern missed: clean display visibility seamlessly
+                    row.style.display = 'none';
+                }
+            }
+        });
+
+        // Toggle visibility indicator block for empty matching row notice layout
+        if (noResultsRow) {
+            noResultsRow.style.display = (rows.length > 0 && visibleCount === 0) ? 'table-row' : 'none';
+        }
+    }
+
     function togglePassword(index, plainPassword) {
         const passSpan = document.getElementById('pass-' + index);
         const btn = passSpan.nextElementSibling;
