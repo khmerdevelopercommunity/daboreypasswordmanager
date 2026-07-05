@@ -21,7 +21,135 @@ $encryption_key = 'YourSuperSecretEncryptionKeyGoesHere';
 $message = "";
 $status = "";
 
-// Handle adding a new credential
+// FETCH ALL CURRENT CREDENTIALS FOR EXPORT OR VIEWING
+function fetchUserCredentials($conn, $userId, $encKey) {
+    $stmt = $conn->prepare("SELECT id, site_name, site_username, AES_DECRYPT(site_password, ?) AS decrypted_password FROM credentials WHERE user_id = ?");
+    $stmt->bind_param("si", $encKey, $userId);
+    $stmt->execute();
+    $result = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt->close();
+    return $result;
+}
+
+// ACTION: EXPORT TO JSON FORMAT
+if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action']) && $_POST['action'] === 'export_backup') {
+    if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token']) {
+        die("Security token validation failed.");
+    }
+    
+    $vaultData = fetchUserCredentials($conn, $_SESSION['user_id'], $encryption_key);
+    log_system_event($conn, $_SESSION['username'], 'VAULT_JSON_EXPORTED');
+    
+    $exportData = [];
+    foreach ($vaultData as $row) {
+        $exportData[] = [
+            'site_name'     => $row['site_name'],
+            'site_username' => $row['site_username'],
+            'site_password' => $row['decrypted_password'] ?? ''
+        ];
+    }
+    
+    header('Content-Type: application/json; charset=utf-8');
+    header('Content-Disposition: attachment; filename="DaboreyPass_Vault_' . date('Ymd_His') . '.json"');
+    echo json_encode($exportData, JSON_PRETTY_PRINT);
+    exit;
+}
+
+// ACTION: UNIVERSAL 5-CONDITION FORGIVING IMPORT ENGINE
+if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action']) && $_POST['action'] === 'import_backup') {
+    if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token']) {
+        die("Security token validation failed.");
+    }
+
+    if (isset($_FILES['backup_file']) && $_FILES['backup_file']['error'] === UPLOAD_ERR_OK) {
+        $fileContent = file_get_contents($_FILES['backup_file']['tmp_name']);
+        $payload = json_decode($fileContent, true);
+        
+        if (is_array($payload)) {
+            $items = $payload;
+            
+            // Auto-unwrap if encapsulated in a parent root key node (like 'entries', 'items', 'logins')
+            if (!isset($payload[0])) { 
+                foreach ($payload as $key => $value) {
+                    if (is_array($value)) {
+                        $items = $value;
+                        break;
+                    }
+                }
+            }
+
+            $success_count = 0;
+            $stmt = $conn->prepare("INSERT INTO credentials (user_id, site_name, site_username, site_password) VALUES (?, ?, ?, AES_ENCRYPT(?, ?))");
+            
+            foreach ($items as $item) {
+                if (!is_array($item)) continue;
+
+                // Eliminate key header case mismatches seamlessly
+                $cleanItem = array_change_key_case($item, CASE_LOWER);
+
+                // 1. Identify Resource Name Variations
+                $site = trim($cleanItem['site_name'] ?? $cleanItem['name'] ?? $cleanItem['title'] ?? $cleanItem['url'] ?? 'Imported Resource');
+                
+                // 2. Identify Identity Username Variations
+                $user = trim($cleanItem['site_username'] ?? $cleanItem['username'] ?? $cleanItem['login_username'] ?? $cleanItem['email'] ?? $cleanItem['user'] ?? '');
+                
+                // 3. Modern 5-Stage Condition Fallback System to Extract Password Profile
+                $pass = '';
+
+                // CONDITION 1: Standard Dashboard Format
+                if (isset($cleanItem['site_password']) && !empty($cleanItem['site_password'])) {
+                    $pass = $cleanItem['site_password'];
+                } 
+                // CONDITION 2: Traditional Generic Format (password/pass)
+                elseif (isset($cleanItem['password']) && !empty($cleanItem['password'])) {
+                    $pass = $cleanItem['password'];
+                } elseif (isset($cleanItem['pass']) && !empty($cleanItem['pass'])) {
+                    $pass = $cleanItem['pass'];
+                } 
+                // CONDITION 3: Hardware / Alternative Crypt-variant label
+                elseif (isset($cleanItem['secret']) && !empty($cleanItem['secret'])) {
+                    $pass = $cleanItem['secret'];
+                } 
+                // CONDITION 4: Common Nested Manager Object Configuration (Bitwarden/Aegis structural fallback style)
+                elseif (isset($cleanItem['login']['password']) && !empty($cleanItem['login']['password'])) {
+                    $pass = $cleanItem['login']['password'];
+                } 
+                // CONDITION 5: Array Value Extraction Fallback (last resort match if raw array is passed)
+                elseif (count($cleanItem) >= 3 && empty($pass)) {
+                    $values = array_values($cleanItem);
+                    $pass = $values[2]; // Fallback to index position assumptions safely
+                }
+
+                $pass = trim($pass);
+
+                if (!empty($site) && !empty($pass)) {
+                    $stmt->bind_param("issss", $_SESSION['user_id'], $site, $user, $pass, $encryption_key);
+                    if ($stmt->execute()) {
+                        $success_count++;
+                    }
+                }
+            }
+            $stmt->close();
+            
+            if ($success_count > 0) {
+                log_system_event($conn, $_SESSION['username'], 'VAULT_JSON_IMPORTED_COUNT_' . $success_count);
+                $message = "Migration Complete! Loaded " . $success_count . " logins into your vault.";
+                $status = "success";
+            } else {
+                $message = "Could not map structural key data variables from this file schema template.";
+                $status = "error";
+            }
+        } else {
+            $message = "Invalid JSON file hierarchy structure format.";
+            $status = "error";
+        }
+    } else {
+        $message = "File system import failure. Check file sizes or try again.";
+        $status = "error";
+    }
+}
+
+// Handle adding a new credential manually
 if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action']) && $_POST['action'] === 'add_credential') {
     if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token']) {
         die("Security token validation failed.");
@@ -32,7 +160,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action']) && $_POST['a
     $site_password = trim($_POST['site_password']);
 
     if (!empty($site_name) && !empty($site_username) && !empty($site_password)) {
-        // Encrypt the password using MySQL's AES_ENCRYPT
         $stmt = $conn->prepare("INSERT INTO credentials (user_id, site_name, site_username, site_password) VALUES (?, ?, ?, AES_ENCRYPT(?, ?))");
         $stmt->bind_param("issss", $_SESSION['user_id'], $site_name, $site_username, $site_password, $encryption_key);
         
@@ -48,9 +175,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action']) && $_POST['a
     }
 }
 
-// ==========================================
-// HANDLE DELETING A CREDENTIAL (NEW CODE)
-// ==========================================
+// HANDLE DELETING A CREDENTIAL
 if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action']) && $_POST['action'] === 'delete_credential') {
     if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token']) {
         die("Security token validation failed.");
@@ -58,7 +183,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action']) && $_POST['a
 
     $credential_id = intval($_POST['credential_id']);
 
-    // Ensure the entry actually belongs to the logged-in user before deleting
     $stmt = $conn->prepare("DELETE FROM credentials WHERE id = ? AND user_id = ?");
     $stmt->bind_param("ii", $credential_id, $_SESSION['user_id']);
     
@@ -73,7 +197,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action']) && $_POST['a
     $stmt->close();
 }
 
-// Fetch all existing credentials for this user, decrypting on the fly
+// Fetch database records for viewing
 $search_query = "";
 if (isset($_GET['search'])) {
     $search_query = trim($_GET['search']);
@@ -100,14 +224,14 @@ $stmt->close();
     <title>DaboreyPass - Dashboard</title>
     <style>
         body { font-family: 'Segoe UI', Arial, sans-serif; background-color: #0f172a; color: #f8fafc; margin: 0; padding: 20px; }
-        .container { max-width: 950px; margin: 0 auto; } /* Widened slightly to account for the new column */
+        .container { max-width: 950px; margin: 0 auto; }
         .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; padding-bottom: 20px; margin-bottom: 30px; }
         h1 { color: #38bdf8; margin: 0; font-size: 28px; }
         .welcome { color: #94a3b8; font-size: 14px; }
         .logout-btn { padding: 8px 16px; background: #ef4444; color: white; text-decoration: none; border-radius: 4px; font-weight: bold; font-size: 14px; }
         
         .grid { display: grid; grid-template-columns: 1fr 2fr; gap: 30px; }
-        .box { background: #1e293b; padding: 25px; border-radius: 8px; border: 1px solid #334155; height: fit-content; }
+        .box { background: #1e293b; padding: 25px; border-radius: 8px; border: 1px solid #334155; height: fit-content; margin-bottom: 25px; }
         h3 { margin-top: 0; color: #38bdf8; border-bottom: 1px solid #334155; padding-bottom: 10px; }
         
         input { width: 100%; padding: 10px; margin: 8px 0 16px 0; box-sizing: border-box; border: 1px solid #475569; border-radius: 4px; background: #0f172a; color: #fff; }
@@ -134,10 +258,16 @@ $stmt->close();
         .copy-btn { background: #10b981; }
         .copy-btn:hover { background: #059669; }
         
-        /* Delete Button styling */
         .delete-btn { background: #b91c1c; }
         .delete-btn:hover { background: #991b1b; }
         .delete-form { display: inline; margin: 0; padding: 0; }
+
+        /* Migration Toolkit Interface */
+        .backup-tray { display: flex; flex-direction: column; gap: 14px; border-top: 2px dashed #334155; padding-top: 20px; margin-top: 20px; }
+        .btn-backup { background: #4f46e5; border: none; color: white; font-weight: bold; padding: 12px; border-radius: 4px; cursor: pointer; width: 100%; text-align: center; display: block; text-decoration: none; font-size: 14px; box-sizing: border-box; }
+        .btn-backup:hover { background: #4338ca; }
+        .import-box-area { background: #0f172a; border: 1px dashed #475569; border-radius: 6px; padding: 14px; text-align: center; cursor: pointer; color: #94a3b8; font-size: 13px; }
+        .import-box-area:hover { border-color: #a855f7; color: #fff; }
 
         .no-data { text-align: center; color: #64748b; padding: 20px; }
     </style>
@@ -158,23 +288,45 @@ $stmt->close();
         ?>
 
         <div class="grid">
-            <div class="box">
-                <h3>Add New Entry</h3>
-                <form method="POST" action="">
-                    <input type="hidden" name="action" value="add_credential">
-                    <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
-                    
-                    <label>Website Name / Resource</label>
-                    <input type="text" name="site_name" placeholder="e.g. Google, GitHub" required autocomplete="off">
-                    
-                    <label>Username / Email</label>
-                    <input type="text" name="site_username" placeholder="Username" required autocomplete="off">
-                    
-                    <label>Password</label>
-                    <input type="password" name="site_password" placeholder="Password" required>
-                    
-                    <button type="submit">Secure Entry</button>
-                </form>
+            <div>
+                <div class="box">
+                    <h3>Add New Entry</h3>
+                    <form method="POST" action="">
+                        <input type="hidden" name="action" value="add_credential">
+                        <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
+                        
+                        <label>Website Name / Resource</label>
+                        <input type="text" name="site_name" placeholder="e.g. Google, GitHub" required autocomplete="off">
+                        
+                        <label>Username / Email</label>
+                        <input type="text" name="site_username" placeholder="Username" required autocomplete="off">
+                        
+                        <label>Password</label>
+                        <input type="password" name="site_password" placeholder="Password" required>
+                        
+                        <button type="submit">Secure Entry</button>
+                    </form>
+                </div>
+
+                <div class="box">
+                    <h3>Vault Migration</h3>
+                    <div class="backup-tray">
+                        <form method="POST" action="">
+                            <input type="hidden" name="action" value="export_backup">
+                            <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
+                            <button type="submit" class="btn-backup">Export Vault (.json)</button>
+                        </form>
+
+                        <form method="POST" action="" enctype="multipart/form-data" id="import-form">
+                            <input type="hidden" name="action" value="import_backup">
+                            <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
+                            <div class="import-box-area" onclick="document.getElementById('import-file-input').click()">
+                                <span>Click to Import Backup JSON</span>
+                                <input type="file" id="import-file-input" name="backup_file" accept=".json" style="display:none;" onchange="document.getElementById('import-form').submit();">
+                            </div>
+                        </form>
+                    </div>
+                </div>
             </div>
 
             <div class="box">
@@ -252,13 +404,11 @@ $stmt->close();
             return;
         }
         
-        // Use the native Clipboard API
         navigator.clipboard.writeText(plainPassword).then(() => {
             const originalText = button.innerText;
             button.innerText = 'Copied!';
             button.style.background = '#059669';
             
-            // Revert back after 1.2 seconds
             setTimeout(() => {
                 button.innerText = originalText;
                 button.style.background = '#10b981';
